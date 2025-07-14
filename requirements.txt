@@ -1,0 +1,13 @@
+certifi==2021.10.8
+chardet==4.0.0
+idna==2.10
+numpy==1.16.6
+pandas==0.24.2
+Pillow==6.2.2
+python-dateutil==2.9.0.post0
+pytz==2025.2
+reportlab==3.5.59
+requests==2.27.1
+six==1.17.0
+tabulate==0.8.10
+urllib3==1.26.20
