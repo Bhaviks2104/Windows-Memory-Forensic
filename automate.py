@@ -12,10 +12,12 @@ import pandas as pd
 import re
 import hashlib
 import requests
+import ntpath
 from datetime import datetime
 from NPIP_Verify import is_suspicious_name, check_instance_count, check_parent, check_path
 from DNH_Verify import *
 from parent_child_process import profiles, CACHE_FILE, VTSCANX_URL, VTSCANX_API_KEY, VT_SCAN_THRESHOLD, CATEGORY_PRIORITIES
+from volatility import conf, registry, commands
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Spacer
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
@@ -23,10 +25,13 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from xml.sax.saxutils import escape
+from jinja2 import Environment, FileSystemLoader
 import cgi 
 
 reload(sys)
 sys.setdefaultencoding('utf-8')  
+env = Environment(loader=FileSystemLoader('.'))
+template = env.get_template('report.html')
 
 plugins = ["pslist", "pstree", "psscan", "cmdline", "dlllist", "hollowfind", "handles", "ldrmodules", "networkscan", "ssdt", "modules", "modscan", "malfind"]
 results = {}
@@ -61,7 +66,7 @@ def run_plugin(memory_file, profile, plugin, results):
     final_profile_used = profile  # Default to initial profile
 
     def execute_plugin(p):
-        cmd = "python2 vol.py -f {} --profile={} {}".format(memory_file, p, plugin)
+        cmd = "python2.7 vol.py -f {} --profile={} {}".format(memory_file, p, plugin)
         if plugin == "procdump" or plugin == "dlldump":
             memfile_base = os.path.splitext(os.path.basename(memory_file))[0]
             dump_dir = os.path.join("dump", memfile_base)
@@ -76,10 +81,21 @@ def run_plugin(memory_file, profile, plugin, results):
         
         process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         output, error = process.communicate()
+                # Check for fatal errors first
         if process.returncode != 0:
-            print("[!] Error running {}: {}".format(plugin, error))
+            # Split the full error output and get the first line for a clean summary
+            primary_error = error.strip().split('\n')[0]
+            print("[!] Error running {}: {}".format(plugin, primary_error))
             return None, p
 
+        # If the command was successful, check for non-critical warnings in stderr
+        if error:
+            error_lines = error.strip().split("\n")
+            # Filter out the Volatility banner and other noise to only show relevant warnings
+            filtered_errors = [line for line in error_lines if "Volatility Foundation" not in line and line.strip() != ""]
+            if filtered_errors:
+                print("Warnings/Info from {}:\n".format(plugin) + "\n".join(filtered_errors))
+                
         # Filter out non-critical errors
         error_lines = error.strip().split("\n")
         filtered_errors = [line for line in error_lines if "Volatility Foundation" not in line]
@@ -89,22 +105,15 @@ def run_plugin(memory_file, profile, plugin, results):
         if plugin in ['pstree', 'hollowfind']:
             return output, p  # These are text plugins, return raw
         else:
+            output = output[output.index('{'):]
             try:
-                # Find the start of the JSON output
-                json_start_index = output.find('{')
-                if json_start_index == -1:
-                    print("[-] No JSON object found for plugin: {}".format(plugin))
-                    return None, p
-                
-                json_output = output[json_start_index:]
-                parsed = json.loads(json_output)
-                
+                parsed = json.loads(output)
                 if parsed.get("rows", []):  # If rows not empty
                     return parsed, p
                 else:
                     print("[!] No data found with profile: {}".format(p))
                     return parsed, p  # Still return parsed (empty), not None
-            except (json.JSONDecodeError, ValueError):
+            except json.JSONDecodeError:
                 print("[-] Failed to parse JSON for plugin: {}".format(plugin))
                 return None, p
 
@@ -176,7 +185,7 @@ def NPIP_check():
     dlllist_df = dlllist_df.dropna(subset=["Path"])
 
     # Filter only .exe files (case insensitive)
-    exe_paths = dlllist_df[dlllist_df["Path"].str.lower().str.endswith(".exe", na=False)]
+    exe_paths = dlllist_df[dlllist_df["Path"].str.lower().str.endswith(".exe")]
 
     # Keep only "Pid" and "Path" columns, remove duplicates
     exe_paths = exe_paths[["Pid", "Path"]].drop_duplicates()
@@ -186,10 +195,10 @@ def NPIP_check():
 
     # Perform the merge (only keeps processes that have an associated .exe)
     dlllist_path = psscan_df.merge(exe_paths, on="PID", how="inner")  # Use "inner" to remove unmatched PIDs
-    
+    # ldrmodules = pd.DataFrame(results["ldrmodules"]["rows"], columns=["Pid", "Process", "Base", "InLoad", "InInit", "InMem", "MappedPath"])
     cmdline_path = pd.DataFrame(results["cmdline"]["rows"], columns=["Process", "PID", "CommandLine"])
     handles = pd.DataFrame(results["handles"]["rows"], columns=["Offset(V)", "Pid", "Handle", "Access", "Type", "Details"])
-    
+    # malfind_df = pd.DataFrame(results["malfind"]["rows"], columns=results["malfind"]["columns"])
     try:
         if "hollowfind" in results and results["hollowfind"]:
             hollowfind_path = extract_hollowfind_paths(results["hollowfind"])
@@ -204,7 +213,7 @@ def NPIP_check():
         process_name = row["Process Name"]
         pid = row["PID"]
         # Get expected instance count (default 1 if not found in known processes)
-        actual_count = process_counts.get(process_name, 0)
+        actual_count = process_counts[process_name]
 
         # Initialize a dictionary to hold reasons for the current process
         reasons_dict = {}
@@ -230,17 +239,16 @@ def NPIP_check():
         pid_specific_dll = dlllist_path[dlllist_path["PID"] == pid]["Executable Path"].values
         pid_specific_cmd = cmdline_path[cmdline_path["PID"] == pid]["CommandLine"].values
         pid_specific_peb = (
-            hollowfind_path[hollowfind_path["PID"] == str(pid)]["PEB Path"].values
+            hollowfind_path[hollowfind_path["PID"] == pid]["PEB Path"].values 
             if "hollowfind" in results and not hollowfind_path.empty 
             else []
         )
 
         pid_specific_vad = (
-            hollowfind_path[hollowfind_path["PID"] == str(pid)]["VAD Path"].values
+            hollowfind_path[hollowfind_path["PID"] == pid]["VAD Path"].values 
             if "hollowfind" in results and not hollowfind_path.empty 
             else []
         )
-
 
         if row["Process Name"] != "System" and row["Time Exited"].strip() == "":
             is_path_suspicious, reasons = check_path(
@@ -284,17 +292,15 @@ def add_reasons(pid, process_name, new_reasons):
                 # If it's a string, convert it to the proper format
                 # Try to extract score for proper categorization
                 score_match = re.search(r'score:\s*(\d+)', reason)
-                score = int(score_match.group(1)) if score_match else 'VTScanX'
+                score = int(score_match.group(1))
                 reason = [{'category': score, 'reason': reason}]
             elif not isinstance(reason, list):
                 # If it's neither string nor list, convert to proper format
                 reason = [{'category': 'VTScanX', 'reason': str(reason)}]
             # Ensure each item in the list has both 'category' and 'reason' keys
             elif isinstance(reason, list):
-                for i, item in enumerate(reason):
-                    if not isinstance(item, dict):
-                         reason[i] = {'category': 'VTScanX', 'reason': str(item)}
-                    else:
+                for item in reason:
+                    if isinstance(item, dict):
                         if 'category' not in item:
                             item['category'] = 'VTScanX'
                         if 'reason' not in item:
@@ -307,13 +313,17 @@ def add_reasons(pid, process_name, new_reasons):
                 else:
                     suspicious_processes[pid]["reasons"][key].append(reason)
             else:
-                suspicious_processes[pid]["reasons"][key] = [suspicious_processes[pid]["reasons"][key], reason]
+                suspicious_processes[pid]["reasons"][key] = reason
         else:
-            suspicious_processes[pid]["reasons"][key] = reason if isinstance(reason, list) else [reason]
+            suspicious_processes[pid]["reasons"][key] = reason
 
+def get_process_name(pid):
+    psscan_df = pd.DataFrame(results["psscan"]["rows"], columns=["Offset(P)", "Process Name", "PID", "PPID", "PDB", "Time Created", "Time Exited"])
+    row = psscan_df[psscan_df["PID"] == pid]
+    return row.iloc[0]["Process Name"] if not row.empty else "Unknown"
 
 def analyze_hidden_network_artifacts():
-    if "netscan" in results and results["netscan"]:
+    if profiles.index(profile) >= 9:
         connections_df = pd.DataFrame(results["netscan"]["rows"], columns=results["netscan"]["columns"])
         for i in range(len(connections_df)):
             row = connections_df.iloc[i]
@@ -327,17 +337,11 @@ def analyze_hidden_network_artifacts():
                         "netscan_reasons": [{'reason': "Possible C2 communication: {}".format(foreign_addr), 'category': 'C2_IP'}]
                     })
 
-    elif all(p in results and results[p] for p in ["connections", "connscan", "sockets", "sockscan"]):
+    else:
         connections_df = pd.DataFrame(results["connections"]["rows"], columns=results["connections"]["columns"])
         connscan_df = pd.DataFrame(results["connscan"]["rows"], columns=results["connscan"]["columns"])
         sockets_df = pd.DataFrame(results["sockets"]["rows"], columns=results["sockets"]["columns"])
         sockscan_df = pd.DataFrame(results["sockscan"]["rows"], columns=results["sockscan"]["columns"])
-        psscan_df = pd.DataFrame(results["psscan"]["rows"],
-                                 columns=["Offset(P)", "Process Name", "PID", "PPID", "PDB", "Time Created", "Time Exited"])
-
-        def get_process_name(pid):
-            row = psscan_df[psscan_df["PID"] == pid]
-            return row.iloc[0]["Process Name"] if not row.empty else "Unknown"
 
         conn_keys = ["LocalAddress", "RemoteAddress", "PID"]
         conn_reasons = find_hidden_entries(connections_df, connscan_df, conn_keys)
@@ -374,34 +378,21 @@ def analyse_ldrmodules_malfind():
         if int(pid) in suspicious_processes:
             new_reasons = {}
 
-            # Get all modules for this process
-            pid_ldrmodules_df = ldrmodules[ldrmodules["Pid"] == pid]
-
-            # *** FIX ***: Filter to only check actual DLLs for injection patterns.
-            if not pid_ldrmodules_df.empty:
-                # The str accessor must be used for each string method.
-                pid_dlls_only_df = pid_ldrmodules_df[
-                    pid_ldrmodules_df['MappedPath'].str.lower().str.endswith('.dll', na=False)
-                ].copy()
-
-                if not pid_dlls_only_df.empty:
-                    is_ldrmodules_suspicious, reasons = check_ldrmodules(pid_dlls_only_df)
-                    if is_ldrmodules_suspicious:
-                        new_reasons["ldrmodules_reasons"] = reasons
+            is_ldrmodules_suspicious, reasons = check_ldrmodules(ldrmodules[ldrmodules["Pid"] == pid])
+            if is_ldrmodules_suspicious:
+                new_reasons["ldrmodules_reasons"] = reasons
 
             if not malfind_df[malfind_df["Pid"] == pid].empty:
                 new_reasons["malfind_reasons"] = [{'reason':"Invalid memory protection permission: PAGE_EXECUTE_READWRITE",'category':'RWX_Memory_Permissions'}]
 
-            if new_reasons:
-                add_reasons(pid, process_name, new_reasons)
-
+            add_reasons(pid, process_name, new_reasons)
 
 def load_vt_cache():
     if os.path.exists(CACHE_FILE):
         try:
             with open(CACHE_FILE, 'r') as f:
                 return json.load(f)
-        except Exception:
+        except:
             return {}
     return {}
 
@@ -412,14 +403,22 @@ def save_vt_cache(cache):
     except Exception as e:
         print("Error saving cache: {}".format(str(e)))
 
+already_scanned_hashes = set()
+
 def vtscanx_scan_file(file_path):
     """
     Submit file hash to the VTScanX API and return scan results if suspicious.
     Uses local cache to avoid redundant queries.
     """
+    global already_scanned_hashes
     SERVER_IP_SCAN_URL = "{}/check_hash".format(VTSCANX_URL)
     headers = {"Authorization": "Bearer {}".format(VTSCANX_API_KEY)}
     sha256_hash = calculate_sha256(file_path)
+
+    if sha256_hash in already_scanned_hashes:
+        return None
+
+    already_scanned_hashes.add(sha256_hash)
 
     vt_cache = load_vt_cache()
     if sha256_hash in vt_cache:
@@ -441,14 +440,8 @@ def vtscanx_scan_file(file_path):
                     parts.append("suggested_threat_label: {}".format(label))
                 if threat_name:
                     parts.append("popular_threat_name: {}".format(threat_name))
-                if score >= 40:
-                    cat = "vt_40"
-                elif score >= 20:
-                    cat = "vt_20"
-                else:
-                    cat = "vt_10"
                 reason_str = ", ".join(parts)
-                reason = [{'reason': reason_str, 'category': cat}]
+                reason = [{'reason': reason_str, 'category': score}]
                 vt_cache[sha256_hash] = reason
                 save_vt_cache(vt_cache)
                 return reason
@@ -482,62 +475,36 @@ def extract_pid_from_filename(filename, source_type):
 
 
 def scan_dump_table(table_name, valid_extensions, source_type, filter_pids=None):
-    if not results.get(table_name) or not results[table_name].get("rows"):
-        print("[-] No data in '{}' to scan. Skipping.".format(table_name))
-        return
-
     dump_df = pd.DataFrame(results[table_name]["rows"], columns=results[table_name]["columns"])
     dump_dir = os.path.join(".", "dump", os.path.splitext(os.path.basename(memory_file))[0])
 
     for _, row in dump_df.iterrows():
-        process_name = row.get("Name") or row.get("Process") or "Unknown"
-        result = row.get("Result", "")
+        process_name = row["Name"]
+        result = row["Result"]
 
         if result.startswith("OK:"):
             file_name = result.split(":", 1)[1].strip()
             file_path = os.path.join(dump_dir, file_name)
 
-            # This outer check is primarily for file existence and PID filtering
             if file_name.lower().endswith(valid_extensions):
                 pid = extract_pid_from_filename(file_name, source_type)
-                if pid is None:
-                    continue
 
                 if (filter_pids is None or pid in filter_pids) and os.path.exists(file_path):
-                    # If scanning DLLs, ensure the source module is a DLL, not the EXE.
-                    if source_type == "dll":
-                        module_path = row.get("Module Name") or row.get("Module")
-                        if not module_path or not module_path.lower().endswith('.dll'):
-                            continue  # Skip this item as it's not a true DLL.
-
                     vt_reasons = vtscanx_scan_file(file_path)
                     if vt_reasons:
-                        # Logic for adding reasons is now correctly filtered.
+                        # If source is DLL, prepend label to each reason
                         if source_type == "dll":
-                            module_path = row.get("Module Name") or row.get("Module") # Re-get for safety
-                            dll_real_name = os.path.basename(module_path) if module_path else file_name
+                            dll_path = row.get("Module Name") or row.get("Module") or file_name
+                            dll_real_name = os.path.basename(dll_path)
+                            if dll_real_name.lower() == process_name.lower():
+                                continue
                             label = "Suspicious DLL: {}".format(dll_real_name)
-                            
-                            new_vt_reasons = []
-                            reasons_to_process = vt_reasons if isinstance(vt_reasons, list) else [vt_reasons]
-                            
-                            for item in reasons_to_process:
-                                if isinstance(item, dict):
-                                    reason_text = item.get("reason", "")
-                                    category = item.get("category", "VTScanX")
-                                    new_vt_reasons.append({
-                                        "reason": "{} | {}".format(label, reason_text),
-                                        "category": category
-                                    })
-                                else:
-                                    new_vt_reasons.append({
-                                        "reason": "{} | {}".format(label, str(item)),
-                                        "category": "VTScanX"
-                                    })
-                            
-                            add_reasons(pid, process_name, {"vtscanx_reasons": new_vt_reasons})
-                        else: # For source_type == "exe"
-                            add_reasons(pid, process_name, {"vtscanx_reasons": vt_reasons})
+
+                            for item in vt_reasons:
+                                item["reason"] = "{} | {}".format(label, item["reason"])
+
+                        # Add correctly as list of dicts
+                        add_reasons(pid, process_name, {"vtscanx_reasons": vt_reasons})
 
 def vtscanx_scan():
     if scan_procdump:
@@ -546,7 +513,6 @@ def vtscanx_scan():
 
     if scan_dlldump:
         print("\n[+] Scanning all DLL dumps...")
-        # Note: Volatility's dlldump can save files with a .dll extension, so we use that here.
         scan_dump_table("dlldump", (".dll", ), "dll")
 
     if scan_suspicious_only:
@@ -559,142 +525,273 @@ def vtscanx_scan():
         pids = suspicious_processes.keys()
         scan_dump_table("dlldump", (".dll", ), "dll", pids)
 
-def ssdt_hooks():
-    RED = "\033[91m"    # Red color
-    RESET = "\033[0m"   # Reset color
-    print("\n[+] SSDT Hooking Report")
-    print("=" * 50)
-
-    if not results.get("ssdt") or not results["ssdt"].get("rows"):
-        print("No SSDT data available.")
-        return
-
+def analyze_ssdt_hooks():
+    """
+    Analyzes SSDT data from results to find hooks from non-standard owners.
+    
+    Args:
+        results (dict): The dictionary containing raw plugin output.
+        
+    Returns:
+        list: A list of dictionaries, where each dictionary represents a hooked function.
+              Returns an empty list if no hooks are found or data is missing.
+    """
     APIHooking_df = pd.DataFrame(results["ssdt"]["rows"], columns=results["ssdt"]["columns"])
     allowed_owners = ['ntoskrnl.exe', 'win32k.sys']
-
+    
     hooked_functions = []
 
     for index, row in APIHooking_df.iterrows():
-        owner = row['Owner']
-        function_name = row['Function']
-        if owner not in allowed_owners:
-            hooked_functions.append((function_name, owner, row['Entry'], row['Addr']))
+        owner = row.get('Owner')
+        # Filter out hooks from allowed owners
+        if owner and owner not in allowed_owners:
+            # Append a dictionary for easier use in the template
+            hooked_functions.append({
+                'function_name': row.get('Function'),
+                'owner': owner,
+                'entry': row.get('Entry'),
+                'address': "0x{:X}".format(row.get('Addr', 0)) # Format address as hex
+            })
 
-    if not hooked_functions:
-        print("No SSDT hooks detected.")
-        return
+    return hooked_functions
 
-    for func_name, owner, entry, addr in hooked_functions:
-        print("Function Name: {}{}{}".format(RED, func_name, RESET))
-        print("Entry Number: {}".format(entry))
-        print("Address: 0x{:X}".format(addr))  # Format address in hex
-        print("Hooked By: {}".format(owner))
+
+
+def print_ssdt_hooks_report(hooked_functions):
+    """
+    Prints a formatted report of SSDT hooks to the console.
+    
+    Args:
+        hooked_functions (list): The list of hooked function dictionaries from analyze_ssdt_hooks.
+    """
+    RED = "\033[91m"
+    RESET = "\033[0m"
+    print("\n[+] SSDT Hooking Report")
+    print("=" * 50)
+    hooked_functions = analyze_ssdt_hooks()
+    for hook in hooked_functions:
+        print("Function Name: {}{}{}".format(RED, hook['function_name'], RESET))
+        print("Entry Number: {}".format(hook['entry']))
+        print("Address: {}".format(hook['address']))
+        print("Hooked By: {}".format(hook['owner']))
         print("-" * 50)
 
-def suspicious_modules():
-    RED = "\033[91m"     # Red color for module name
-    YELLOW = "\033[93m"  # Yellow color for hidden status
-    RESET = "\033[0m"    # Reset color
+def ssdt_hooks():
+    """
+    Analyzes and prints a report for suspicious SSDT hooks.
+    This function acts as a wrapper for the analysis and printing logic.
+    """
+    # First, analyze the SSDT data to find hooks
+    hooked_functions = analyze_ssdt_hooks()
+    
+    # Then, print the formatted report to the console
+    print_ssdt_hooks_report(hooked_functions)
 
-    print "\n[+] Suspicious Modules:"
-    print "=" * 60
 
-    if not all(p in results and results[p] for p in ["modules", "modscan"]):
-        print "Module data not available. Skipping."
-        return
+# def suspicious_modules():
+#     RED = "\033[91m"     # Red color for module name
+#     YELLOW = "\033[93m"  # Yellow color for hidden status
+#     RESET = "\033[0m"    # Reset color
 
-    # Load DataFrames
+#     # Load DataFrames
+#     modules_df = pd.DataFrame(results["modules"]["rows"], columns=results["modules"]["columns"])
+#     modscan_df = pd.DataFrame(results["modscan"]["rows"], columns=results["modscan"]["columns"])
+
+#     # Convert Base columns to int (assumes already int or convertible)
+#     def safe_int(val):
+#         try:
+#             return int(val)
+#         except:
+#             return None
+
+#     modules_df['Base'] = modules_df['Base'].apply(safe_int)
+#     modscan_df['Base'] = modscan_df['Base'].apply(safe_int)
+
+#     # Suspicious path detection
+#     def is_suspicious(path):
+#         if not path or "\\" not in path:
+#             return False
+#         normalized_path = path.replace("\\", "\\\\").lower()
+#         safe_paths = [
+#             r"\\systemroot\\system32\\",
+#             r"c:\\windows\\system32\\",
+#             r"\\windows\\system32\\"
+#         ]
+#         for safe in safe_paths:
+#             if normalized_path.startswith(safe):
+#                 return False
+#         return True
+
+#     # Mark suspicious modules from modules list
+#     modules_df['is_suspicious'] = modules_df['File'].apply(is_suspicious)
+#     suspicious_df = modules_df[modules_df['is_suspicious'] == True].copy()
+#     suspicious_df['Status'] = ''
+#     suspicious_df['Reason'] = 'Suspicious path'
+
+#     # Detect hidden modules (bases in modscan but NOT in modules)
+#     known_bases = set(modules_df['Base'].dropna())
+#     hidden_df = modscan_df[~modscan_df['Base'].isin(known_bases)].copy()
+#     hidden_df['Status'] = 'Hidden'
+
+#     # Reset index before applying functions to avoid pandas error
+#     hidden_df = hidden_df.reset_index(drop=True)
+
+#     if not hidden_df.empty:
+#         hidden_df['is_suspicious'] = hidden_df['File'].apply(is_suspicious)
+
+#         def reason_label(row):
+#             if row['Status'] == 'Hidden' and row['is_suspicious']:
+#                 return 'Hidden + Suspicious path'
+#             elif row['Status'] == 'Hidden':
+#                 return 'Hidden'
+#             elif row.get('is_suspicious', False):
+#                 return 'Suspicious path'
+#             else:
+#                 return ''
+
+#         hidden_df['Reason'] = hidden_df.apply(reason_label, axis=1)
+#     else:
+#         hidden_df['is_suspicious'] = []
+#         hidden_df['Reason'] = []
+
+#     # Fill missing cols in hidden_df for consistent concat
+#     for col in ['Name', 'File', 'Size']:
+#         if col not in hidden_df.columns:
+#             hidden_df[col] = 'Unknown'
+#         hidden_df[col] = hidden_df[col].fillna('Unknown')
+
+#     # Ensure suspicious_df has all needed columns
+#     for col in ['Name', 'File', 'Base', 'Size', 'Status', 'Reason']:
+#         if col not in suspicious_df.columns:
+#             suspicious_df[col] = 'Unknown'
+
+#     # Combine both DataFrames
+#     combined_df = pd.concat([suspicious_df, hidden_df], ignore_index=True, sort=True)
+#     print "\n[+] Suspicious Modules:"
+#     print "=" * 60
+#     if combined_df.empty:
+#         print "No suspicious or hidden modules detected."
+#     else:
+#         for idx, row in combined_df.iterrows():
+#             name_str = RED + str(row['Name']) + RESET
+#             if row['Status'] == 'Hidden':
+#                 name_str += " " + YELLOW + "[Hidden]" + RESET
+
+#             print "Module Name: " + name_str
+#             print "File Path  : " + row['File'].encode('utf-8')
+
+#             try:
+#                 base_val = int(row['Base'])
+#                 print "Base Addr  : 0x%X" % base_val
+#             except:
+#                 print "Base Addr  : Unknown"
+
+#             print "Size       : " + str(row['Size'])
+#             print "Reason     : " + str(row['Reason'])
+#             print "-" * 50
+
+def analyze_suspicious_modules():
+    """
+    Analyzes modules and modscan data to find suspicious and hidden kernel modules.
+    
+    Args:
+        results (dict): The dictionary containing raw plugin output.
+        
+    Returns:
+        list: A list of dictionaries, where each dictionary represents a suspicious module.
+    """
+    # Safety check for missing plugin data
+    if "modules" not in results or "modscan" not in results:
+        return []
+
     modules_df = pd.DataFrame(results["modules"]["rows"], columns=results["modules"]["columns"])
     modscan_df = pd.DataFrame(results["modscan"]["rows"], columns=results["modscan"]["columns"])
 
-    # Convert Base columns to int (assumes already int or convertible)
+    # --- Data Preparation and Analysis ---
     def safe_int(val):
-        try:
-            return int(val)
-        except (ValueError, TypeError):
-            return None
-
+        try: return int(val)
+        except: return None
+    
     modules_df['Base'] = modules_df['Base'].apply(safe_int)
     modscan_df['Base'] = modscan_df['Base'].apply(safe_int)
 
-    # Suspicious path detection
-    def is_suspicious(path):
-        if not isinstance(path, (str, unicode)) or "\\" not in path:
-            return False
+    def is_suspicious_path(path):
+        if not isinstance(path, basestring) or "\\" not in path: return False
         normalized_path = path.replace("\\", "\\\\").lower()
-        safe_paths = [
-            r"\\systemroot\\system32\\",
-            r"c:\\windows\\system32\\",
-            r"\\windows\\system32\\"
-        ]
-        for safe in safe_paths:
-            if normalized_path.startswith(safe):
-                return False
-        return True
+        safe_paths = [r"\\systemroot\\system32\\", r"c:\\windows\\system32\\", r"\\windows\\system32\\"]
+        return not any(normalized_path.startswith(safe) for safe in safe_paths)
 
-    # Mark suspicious modules from modules list
-    modules_df['is_suspicious'] = modules_df['File'].apply(is_suspicious)
-    suspicious_df = modules_df[modules_df['is_suspicious'] == True].copy()
-    if not suspicious_df.empty:
-        suspicious_df['Status'] = ''
-        suspicious_df['Reason'] = 'Suspicious path'
-
-    # Detect hidden modules (bases in modscan but NOT in modules)
+    suspicious_df = modules_df[modules_df['File'].apply(is_suspicious_path)].copy()
+    suspicious_df['Reason'] = 'Suspicious path'
+    
     known_bases = set(modules_df['Base'].dropna())
     hidden_df = modscan_df[~modscan_df['Base'].isin(known_bases)].copy()
-    if not hidden_df.empty:
-        hidden_df['Status'] = 'Hidden'
-
-        # Reset index before applying functions to avoid pandas error
-        hidden_df = hidden_df.reset_index(drop=True)
-
-        hidden_df['is_suspicious'] = hidden_df['File'].apply(is_suspicious)
-
-        def reason_label(row):
-            if row['Status'] == 'Hidden' and row['is_suspicious']:
-                return 'Hidden + Suspicious path'
-            elif row['Status'] == 'Hidden':
-                return 'Hidden'
-            elif row.get('is_suspicious', False):
-                return 'Suspicious path'
-            else:
-                return ''
-
-        hidden_df['Reason'] = hidden_df.apply(reason_label, axis=1)
     
-    # Fill missing cols in hidden_df for consistent concat
-    for col in ['Name', 'File', 'Size']:
-        if col not in hidden_df.columns:
-            hidden_df[col] = 'Unknown'
-        hidden_df[col] = hidden_df[col].fillna('Unknown')
-
-    # Ensure suspicious_df has all needed columns
-    for col in ['Name', 'File', 'Base', 'Size', 'Status', 'Reason']:
-        if col not in suspicious_df.columns:
-            suspicious_df[col] = 'Unknown'
-
-    # Combine both DataFrames
-    combined_df = pd.concat([suspicious_df, hidden_df], ignore_index=True, sort=True)
-    if combined_df.empty:
-        print "No suspicious or hidden modules detected."
-    else:
+    if not hidden_df.empty:
+        hidden_df['is_suspicious_path'] = hidden_df['File'].apply(is_suspicious_path)
+        def determine_reason(row):
+            is_hidden = True # All modules in this df are hidden
+            is_suspicious = row['is_suspicious_path']
+            if is_hidden and is_suspicious: return 'Hidden + Suspicious path'
+            return 'Hidden'
+        hidden_df['Reason'] = hidden_df.apply(determine_reason, axis=1)
+    
+    combined_df = pd.concat([suspicious_df, hidden_df], ignore_index=True, sort=False).fillna('Unknown')
+    
+    # --- Format final output list ---
+    final_modules_list = []
+    if not combined_df.empty:
         for idx, row in combined_df.iterrows():
-            name_str = RED + str(row['Name']) + RESET
-            if row['Status'] == 'Hidden':
-                name_str += " " + YELLOW + "[Hidden]" + RESET
+            is_hidden = 'Hidden' in str(row.get('Reason'))
+            try: base_addr = "0x{:X}".format(int(row.get('Base')))
+            except: base_addr = "Unknown"
+            
+            final_modules_list.append({
+                'name': row.get('Name'),
+                'path': row.get('File'),
+                'base_addr': base_addr,
+                'size': row.get('Size'),
+                'reason': row.get('Reason'),
+                'is_hidden': is_hidden
+            })
+            
+    return final_modules_list
 
-            print "Module Name: " + name_str
-            print "File Path  : " + str(row.get('File', 'Unknown')).encode('utf-8')
+def print_suspicious_modules_report():
+    """
+    Prints a formatted report of suspicious modules to the console.
+    
+    Args:
+        suspicious_modules (list): The list of module dictionaries from the analyze function.
+    """
+    RED = "\033[91m"
+    YELLOW = "\033[93m"
+    RESET = "\033[0m"
+    print("\n[+] Suspicious Modules Report")
+    print("=" * 60)
+    
+    suspicious_modules = analyze_suspicious_modules()
 
-            try:
-                base_val = int(row['Base'])
-                print "Base Addr  : 0x%X" % base_val
-            except (ValueError, TypeError):
-                print "Base Addr  : Unknown"
+    for module in suspicious_modules:
+        name_str = RED + module['name'] + RESET
+        if module['is_hidden']:
+            name_str += " " + YELLOW + "[Hidden]" + RESET
+            
+        print("Module Name: " + name_str)
+        print("File Path  : " + module['path'].encode('utf-8'))
+        print("Base Addr  : " + module['base_addr'])
+        print("Size       : " + str(module['size']))
+        print("Reason     : " + module['reason'])
+        print("-" * 50)
 
-            print "Size       : " + str(row.get('Size', 'Unknown'))
-            print "Reason     : " + str(row.get('Reason', 'Unknown'))
-            print "-" * 50
+
+def suspicious_modules():
+    """
+    Analyzes and prints a report for suspicious kernel modules.
+    This is a wrapper function for the analysis and printing logic.
+    """
+    print_suspicious_modules_report()
+
 
 def print_suspicious_process():
     RED = "\033[91m"
@@ -735,9 +832,6 @@ def print_suspicious_process():
 
         total_score = 0
         for reason_key, reason_list in reasons_dict.iteritems():
-            if not isinstance(reason_list, list):
-                reason_list = [reason_list]
-
             for reason_item in reason_list:
                 if isinstance(reason_item, dict):
                     cat = reason_item.get('category')
@@ -802,15 +896,9 @@ def print_suspicious_process():
 
         print "-" * 50
 
-
 def print_hidden_processes(pslist_data, psscan_data):
     """Identify and print hidden processes using tabulate in rst format."""
     global suspicious_processes
-    
-    if not pslist_data or not psscan_data:
-        print("pslist or psscan data not available. Cannot check for hidden processes.")
-        return
-
     pslist_pids = {entry[2] for entry in pslist_data}  # Extract PIDs from pslist_data
     psscan_pids = {entry[2] for entry in psscan_data}  # Extract PIDs from psscan_data
     hidden_pids = psscan_pids - pslist_pids  # Find PIDs present in psscan but not in pslist
@@ -887,7 +975,7 @@ def generate_txt_report(report_name, report_dir, include_plugins=None, include_a
     temp_output = StringIO.StringIO()
     sys.stdout = temp_output
     try:
-        suspicious_modules()
+        print_suspicious_modules_report()
     finally:
         sys.stdout = original_stdout
         output_buffer.write(strip_ansi(temp_output.getvalue()) + "\n")
@@ -926,8 +1014,6 @@ def generate_txt_report(report_name, report_dir, include_plugins=None, include_a
 
     # Save the report
     try:
-        if not os.path.exists(report_dir):
-            os.makedirs(report_dir)
         file_path = os.path.join(report_dir, "{}.txt".format(report_name))
         with open(file_path, "w") as f:
             f.write(output_buffer.getvalue())
@@ -945,371 +1031,59 @@ def inject_wrap_td(row_html, index):
             output.append('<td>%s</td>' % cell)
     return ''.join(output)
 
-def _highlight_score_html(reason):
-    """
-    Finds a 'score' in a reason string and wraps it in a colored <span> for HTML.
-    """
-    try:
-        reason = str(reason)
-        match = re.search(r"(score:\s*)(\d+)", reason)
-        if match:
-            score_val = int(match.group(2))
-            if score_val > 50:
-                color = "#e74c3c"  # Red
-            elif score_val > 20:
-                color = "#f1c40f"  # Yellow
-            else:
-                color = "#3498db"  # Blue
 
-            colored_score = '{}<span style="color: {}; font-weight: bold;">{}</span>'.format(
-                match.group(1), color, match.group(2))
-            return reason.replace(match.group(0), colored_score)
-    except:
-        pass
-    return reason
-
-# This function should already be in your script from the last step.
-# No changes are needed here.
 def _calculate_process_scores(suspicious_data):
     """
-    Calculates a summary score for each suspicious process.
-    ... (function content is unchanged) ...
+    Calculates total and VT-specific scores for each suspicious process and sorts them.
+
+    Args:
+        suspicious_data (dict): The global suspicious_processes dictionary.
+
+    Returns:
+        list: A list of dictionaries, sorted by score, each containing
+              pid, name, score, and vt_score.
     """
     process_scores = []
-
     for pid, details in suspicious_data.iteritems():
         process_name = details.get("process_name", "Unknown")
         reasons_dict = details.get("reasons", {})
 
-        # Calculate the total suspicious score (Priority)
         total_score = 0
+        vt_score = 'N/A'  # Default value if no VT scan reason exists
+
         for reason_key, reason_list in reasons_dict.iteritems():
             if not isinstance(reason_list, list):
-                reason_list = [reason_list]
-                
+                reason_list = [reason_list]  # Ensure it's always a list
+
             for reason_item in reason_list:
                 if isinstance(reason_item, dict):
-                    cat = reason_item.get('category')
-                    try:
-                        total_score += int(cat)
-                    except (ValueError, TypeError):
-                        total_score += CATEGORY_PRIORITIES.get(cat, 0)
-
-        # Extract the highest VirusTotal score
-        max_vt_score = -1
-        if "vtscanx_reasons" in reasons_dict:
-            for item in reasons_dict["vtscanx_reasons"]:
-                reason_text = item.get('reason', '')
-                match = re.search(r'score:\s*(\d+)', reason_text)
-                if match:
-                    score = int(match.group(1))
-                    if score > max_vt_score:
-                        max_vt_score = score
-        
-        vt_score_display = str(max_vt_score) if max_vt_score != -1 else "N/A"
+                    category = reason_item.get('category')
+                    
+                    # Handle VTScanX scores, which are directly used as the score value
+                    if reason_key == 'vtscanx_reasons':
+                        try:
+                            current_vt_score = int(category)
+                            total_score += current_vt_score
+                            # Keep the highest VT score found for the process as its primary vt_score
+                            if vt_score == 'N/A' or current_vt_score > vt_score:
+                                vt_score = current_vt_score
+                        except (ValueError, TypeError):
+                            # Fallback for non-integer categories
+                            total_score += get_priority(category)
+                    else:
+                        # Use the priority mapping for all other categories
+                        total_score += get_priority(category)
 
         process_scores.append({
             'pid': pid,
             'name': process_name,
             'score': total_score,
-            'vt_score': vt_score_display
+            'vt_score': vt_score
         })
 
+    # Sort the processes by total score in descending order for the report
     process_scores.sort(key=lambda x: x['score'], reverse=True)
     return process_scores
-
-def _generate_suspicious_process_html(suspicious_data):
-    """
-    Generates an interactive HTML block for suspicious processes where the
-    summary table itself contains the hyperlinks.
-    """
-    if not suspicious_data:
-        return "<h2>Suspicious Process Analysis</h2><p>No suspicious processes detected.</p>"
-
-    scores_data = _calculate_process_scores(suspicious_data)
-    html_buffer = StringIO.StringIO()
-    
-    html_buffer.write("<h2>Suspicious Process Analysis</h2>")
-    html_buffer.write("<h3>Process Risk Summary (Click Name for Details)</h3>")
-    html_buffer.write('<table class="summary-table">')
-    html_buffer.write("<thead><tr>")
-    
-    # --- THIS IS THE MODIFIED LINE ---
-    html_buffer.write("<th>PID</th><th>Process Name</th><th>Suspicious Score (Priority)</th><th>VirusTotal</th>")
-    # --- END OF MODIFICATION ---
-
-    html_buffer.write("</tr></thead>")
-    
-    html_buffer.write("<tbody>")
-    for item in scores_data:
-        pid = item['pid']
-        process_name = escape(str(item['name']))
-        process_name_link = "<a href='#suspicious-pid-{}'>{}</a>".format(pid, process_name)
-        html_buffer.write("<tr>")
-        html_buffer.write("<td>%s</td>" % item['pid'])
-        html_buffer.write("<td>%s</td>" % process_name_link)
-        html_buffer.write("<td>%s</td>" % item['score'])
-        html_buffer.write("<td>%s</td>" % item['vt_score']) # This data comes from the 'vt_score' key
-        html_buffer.write("</tr>")
-    html_buffer.write("</tbody></table>")
-    html_buffer.write("<hr>")
-    
-    html_buffer.write("<h3>Process Details</h3>")
-    # ... (the rest of the function remains the same) ...
-    for item in scores_data:
-        pid = item['pid']
-        details = suspicious_data[pid]
-        process_name = item['name']
-        is_hidden = "hidden_process" in details.get("reasons", {})
-        header_text = "Process: {} (PID: {})".format(escape(process_name), pid)
-        if is_hidden:
-            header_text += ' <span class="hidden-tag">[Hidden]</span>'
-        html_buffer.write(
-            "<h4 id='suspicious-pid-{}' class='clickable-header' onclick='toggleReasons(\"reasons-for-{}\")'>{} ▾</h4>".format(
-                pid, pid, header_text
-            )
-        )
-        html_buffer.write("<div id='reasons-for-{}' class='reasons-div' style='display:none;'>".format(pid))
-        html_buffer.write("<ul>")
-        reasons = details.get("reasons", {})
-        if not reasons:
-            html_buffer.write("<li>No specific reasons found, but flagged by heuristics.</li>")
-        else:
-            all_reasons = []
-            for reason_key, reason_list in reasons.items():
-                if reason_key == "hidden_process": continue
-                if not isinstance(reason_list, list): reason_list = [reason_list]
-                for reason_item in reason_list:
-                    if isinstance(reason_item, dict):
-                        all_reasons.append(reason_item.get('reason', ''))
-                    else:
-                        all_reasons.append(str(reason_item))
-            for reason in sorted(all_reasons):
-                highlighted_reason = _highlight_score_html(reason)
-                html_buffer.write("<li>{}</li>".format(highlighted_reason))
-        html_buffer.write("</ul></div>")
-        
-    return html_buffer.getvalue()
-
-def generate_html_report(report_name, report_dir, include_plugins=None, include_all=False):
-    output_buffer = StringIO.StringIO()
-    file_hash = calculate_sha256(memory_file)
-
-    output_buffer.write("<html><head><title>Volatility Report</title>")
-    output_buffer.write('<meta charset="UTF-8">')
-    output_buffer.write("""
-    <style>
-        body {
-            font-family: 'Segoe UI', sans-serif;
-            background: #f4f6f8;
-            padding: 20px;
-            color: #333;
-        }
-        .container {
-            max-width: 100%;
-            margin: auto;
-            background: white;
-            padding: 20px;
-            border-radius: 8px;
-            box-shadow: 0 0 15px rgba(0,0,0,0.1);
-            overflow-x: auto;
-        }
-        h1 {
-            text-align: center;
-            color: #2c3e50;
-        }
-        h2 {
-            color: #1f618d;
-            border-bottom: 2px solid #ddd;
-            padding-bottom: 5px;
-            margin-top: 30px;
-        }
-        h3 { color: #2980b9; margin-top: 25px; }
-        h4.clickable-header {
-            cursor: pointer;
-            color: #c0392b;
-            padding: 8px;
-            border-radius: 4px;
-            background-color: #f9ebea;
-            border: 1px solid #f5b7b1;
-            margin-top: 15px;
-            transition: background-color 0.2s;
-        }
-        h4.clickable-header:hover { background-color: #f2d7d5; }
-        /* The separate summary-list style is no longer needed */
-        .reasons-div {
-            padding: 15px;
-            margin-left: 20px;
-            border-left: 3px solid #f1c40f;
-            background-color: #fef9e7;
-        }
-        .reasons-div ul {
-             margin-top: 0;
-             padding-left: 20px;
-        }
-        .hidden-tag {
-            color: #e67e22;
-            font-weight: bold;
-            font-style: italic;
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            table-layout: auto;
-        }
-        th, td {
-            border: 1px solid #ccc;
-            padding: 10px;
-            text-align: left;
-            vertical-align: top;
-            word-wrap: break-word;
-        }
-        th {
-            background-color: #f0f0f0;
-        }
-        pre, .code-block {
-            background: #f8f8f8;
-            padding: 10px;
-            border: 1px solid #ccc;
-            border-radius: 5px;
-            overflow-x: auto;
-            white-space: pre-wrap; /* Ensures long lines wrap */
-        }
-        .meta {
-            font-size: 14px;
-            margin-bottom: 20px;
-        }
-        /* Styles for the summary table */
-        .summary-table {
-            width: 90%; /* Increased width slightly */
-            margin: 20px auto;
-            border-collapse: collapse;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
-        }
-        .summary-table th {
-            background-color: #1f618d;
-            color: white;
-            font-weight: bold;
-        }
-        .summary-table td {
-             background-color: #ffffff; /* Explicitly set white background for all cells */
-        }
-        .summary-table tr:nth-child(even) td { /* Target TDs in even rows for background color */
-            background-color: #f2f2f2;
-        }
-        .summary-table tr:hover td { /* Target TDs on hover */
-            background-color: #ddd;
-        }
-        .summary-table a {
-            text-decoration: none;
-            color: #2e86c1;
-            font-weight: bold;
-        }
-        .summary-table a:hover {
-            text-decoration: underline;
-        }
-    </style>
-    <script>
-        function toggleReasons(elementId) {
-            var element = document.getElementById(elementId);
-            if (element.style.display === "none") {
-                element.style.display = "block";
-            } else {
-                element.style.display = "none";
-            }
-        }
-    </script>
-    </head><body><div class='container'>
-    """)
-
-    output_buffer.write("<h1>Volatility Automated Report</h1>")
-    output_buffer.write("<div class='meta'>")
-    output_buffer.write("<p><strong>Memory File:</strong> %s</p>" % memory_file)
-    output_buffer.write("<p><strong>SHA256 Hash:</strong> %s</p>" % file_hash)
-    output_buffer.write("<p><strong>Profile Used:</strong> %s</p>" % profile)
-    output_buffer.write("<p><strong>Generated on:</strong> %s</p>" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    output_buffer.write("</div>")
-
-    # This function call remains the same, but relies on the updated helper function below
-    suspicious_html = _generate_suspicious_process_html(suspicious_processes)
-    output_buffer.write(suspicious_html)
-    
-    def capture_plugin_output(func, title):
-        temp_output = StringIO.StringIO()
-        original_stdout = sys.stdout
-        sys.stdout = temp_output
-        try:
-            func()
-        finally:
-            sys.stdout = original_stdout
-            cleaned_output = strip_ansi(temp_output.getvalue())
-            output_buffer.write("<h2>%s</h2>" % title)
-            output_buffer.write("<pre class='code-block'>%s</pre>" % unicode(cleaned_output, 'utf-8', errors='replace'))
-
-    capture_plugin_output(ssdt_hooks, "SSDT Hook Analysis")
-    capture_plugin_output(suspicious_modules, "Suspicious Modules")
-
-    # This section for including plugin output remains the same
-    if include_all is True and include_plugins is not None:
-        selected_plugins = plugins[:]
-        for p in include_plugins:
-            if is_plugin_exist(p) and p not in selected_plugins:
-                run_plugin(memory_file, profile, p, results)
-                selected_plugins.append(p)
-    elif include_all is True:
-        selected_plugins = plugins[:]
-    elif include_plugins is not None:
-        selected_plugins = []
-        for p in include_plugins:
-            if p not in results.keys() and is_plugin_exist(p):
-                run_plugin(memory_file, profile, p, results)
-            selected_plugins.append(p)
-    else:
-        selected_plugins = []
-
-    for plugin in selected_plugins:
-        data = results.get(plugin)
-        if not data:
-            continue
-
-        output_buffer.write("<h2>Plugin: %s</h2>" % plugin)
-
-        if plugin in ['pstree', 'hollowfind']:
-            output_buffer.write("<pre class='code-block'>%s</pre>" % cgi.escape(unicode(strip_ansi(data), 'utf-8', errors='replace')))
-
-        elif isinstance(data, dict):
-            headers = data.get("columns", [])
-            rows = data.get("rows", [])
-            if headers and rows:
-                output_buffer.write('<table>')
-                output_buffer.write('<tr>')
-                for header in headers:
-                    output_buffer.write('<th style="background-color:#dbe9f4; font-weight:bold;">%s</th>' % header)
-                output_buffer.write('</tr>')
-                for row in rows:
-                    output_buffer.write('<tr>')
-                    for cell in row:
-                        # *** THIS IS THE CORRECTED AND MORE ROBUST WAY TO ESCAPE HTML ***
-                        clean_cell = cgi.escape(strip_ansi(unicode(str(cell), 'utf-8', errors='replace')))
-                        output_buffer.write('<td>%s</td>' % clean_cell)
-                    output_buffer.write('</tr>')
-                output_buffer.write('</table>')
-            else:
-                output_buffer.write("<p>No data available.</p>")
-        else:
-            output_buffer.write("<pre class='code-block'>%s</pre>" % cgi.escape(unicode(strip_ansi(str(data)), 'utf-8', errors='replace')))
-
-    output_buffer.write("</div></body></html>")
-
-    try:
-        if not os.path.exists(report_dir):
-            os.makedirs(report_dir)
-        file_path = os.path.join(report_dir, "%s.html" % report_name)
-        with io.open(file_path, "w", encoding='utf-8') as f:
-            f.write(output_buffer.getvalue())
-        print("[+] HTML report saved to: %s" % file_path)
-    except Exception as e:
-        print("[-] Failed to save HTML report: %s" % str(e))
 
 
 def _generate_suspicious_process_pdf_elements(suspicious_data, styles):
@@ -1419,15 +1193,14 @@ def _generate_suspicious_process_pdf_elements(suspicious_data, styles):
     elements.append(Spacer(1, 0.2 * inch))
     return elements
 
+
+
 def generate_pdf_report(report_name, report_dir, include_plugins=None, include_all=False):
-    if not os.path.exists(report_dir):
-        os.makedirs(report_dir)
 
     file_path = os.path.join(report_dir, "%s.pdf" % report_name)
     doc = SimpleDocTemplate(file_path,pagesize=A4,rightMargin=20,leftMargin=20,topMargin=20,bottomMargin=20)
 
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name='h4', parent=styles['Heading4'], textColor=colors.HexColor('#c0392b')))
     elements = []
 
     # Report Header
@@ -1459,12 +1232,11 @@ def generate_pdf_report(report_name, report_dir, include_plugins=None, include_a
         ("Suspicious Modules", suspicious_modules)
     ]:
         temp_output = StringIO.StringIO()
-        original_stdout = sys.stdout
         sys.stdout = temp_output
         try:
             func()
         finally:
-            sys.stdout = original_stdout
+            sys.stdout = sys.__stdout__
         cleaned_output = strip_ansi(temp_output.getvalue())
         elements.append(Paragraph("<b>%s</b>" % title, styles['Heading2']))
         # Use a Code style for monospaced font
@@ -1513,18 +1285,7 @@ def generate_pdf_report(report_name, report_dir, include_plugins=None, include_a
             headers = data.get("columns", [])
             rows = data.get("rows", [])
             if headers and rows:
-                # Simplified table creation for PDF to avoid complex width calculations
-                table_data = [headers] + [[unicode(str(c), 'utf-8', 'ignore') for c in r] for r in rows]
-                table = Table(table_data)
-                table.setStyle(TableStyle([
-                    ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-                    ('TEXTCOLOR',(0,0),(-1,0),colors.whitesmoke),
-                    ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                    ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-                    ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-                    ('GRID', (0,0), (-1,-1), 1, colors.black)
-                ]))
+                table = create_dynamic_table(headers, rows, doc)
                 elements.append(table)
             else:
                 elements.append(Paragraph("No data available", styles['Normal']))
@@ -1542,7 +1303,265 @@ def generate_pdf_report(report_name, report_dir, include_plugins=None, include_a
         print("[+] PDF report saved to: %s" % file_path)
     except Exception as e:
         print("[-] Failed to save PDF report: %s" % str(e))
+
+def _parse_address(addr_str):
+    """Helper to safely parse IP:Port strings."""
+    if not isinstance(addr_str, basestring) or ':' not in addr_str:
+        return addr_str, 'N/A'
+    parts = addr_str.rsplit(':', 1)
+    return parts[0], parts[1]
+
+def format_suspicious_data(raw_data):
+    """
+    Analyzes raw suspicious process data in a single pass, correctly parsing all
+    process and DLL details from any relevant reason category. Python 2.7 compatible.
+
+    This version correctly handles:
+    - DLLInjected (multi-line)
+    - DLLIllegitimatePath (single-line)
+    - DLLMissingFromList (and extracts the missing-from details)
+    - Windows-style paths on any host operating system.
+
+    Returns:
+        A tuple of (formatted_processes, suspicious_dlls, category_scores).
+    """
+    formatted_processes = []
+    suspicious_dlls = []
+    suspicious_files = []
+    netscan_data = []
+    connections_data = []
+    sockets_data = []
+    category_scores = {}
+
+    if profiles.index(profile) >= 9 and results.get("netscan"):
+        columns = results["netscan"]["columns"]
+        for row_values in results["netscan"]["rows"]:
+            row = dict(zip(columns, row_values)) # Create a dictionary for easy access
+            local_ip, local_port = _parse_address(row.get("LocalAddr", ""))
+            foreign_ip, foreign_port = _parse_address(row.get("ForeignAddr", ""))
+            netscan_data.append({
+                'protocol': row.get("Proto", "N/A"), 'local_ip': local_ip, 'local_port': local_port,
+                'foreign_ip': foreign_ip, 'foreign_port': foreign_port, 'state': row.get("State", " "),
+                'pid': row.get("PID", "N/A"), 'process_name': row.get("Owner", "Unknown")
+            })
+    else: # Logic for pre-Win7 (XP, etc.)
+        if results.get("connections"):
+            columns = results["connections"]["columns"]
+            for row_values in results["connections"]["rows"]:
+                row = dict(zip(columns, row_values)) # <--- FIX: Create dict from list
+                local_ip, local_port = _parse_address(row.get("LocalAddress", ""))
+                foreign_ip, foreign_port = _parse_address(row.get("RemoteAddress", ""))
+                connections_data.append({'local_ip': local_ip, 'local_port': local_port, 'foreign_ip': foreign_ip, 'foreign_port': foreign_port, 'pid': row.get("PID", "N/A"), 'process_name': get_process_name(row.get("PID")), 'is_hidden': False })
+        if results.get("connscan"):
+            columns = results["connscan"]["columns"]
+            for row_values in results["connscan"]["rows"]:
+                row = dict(zip(columns, row_values)) # <--- FIX: Create dict from list
+                local_ip, local_port = _parse_address(row.get("LocalAddress", ""))
+                foreign_ip, foreign_port = _parse_address(row.get("RemoteAddress", ""))
+                connections_data.append({'local_ip': local_ip, 'local_port': local_port, 'foreign_ip': foreign_ip, 'foreign_port': foreign_port, 'pid': row.get("PID", "N/A"), 'process_name': get_process_name(row.get("PID")), 'is_hidden': True })
+
+        # Process sockets and sockscan
+        if results.get("sockets"):
+            columns = results["sockets"]["columns"]
+            for row_values in results["sockets"]["rows"]:
+                row = dict(zip(columns, row_values)) # <--- FIX: Create dict from list
+                sockets_data.append({ 'protocol': row.get("Protocol", "N/A"), 'address': row.get("Address", "N/A"), 'port': row.get("Port", "N/A"), 'pid': row.get("PID", "N/A"), 'process_name': get_process_name(row.get("PID")), 'is_hidden': False })
+        if results.get("sockscan"):
+            columns = results["sockscan"]["columns"]
+            for row_values in results["sockscan"]["rows"]:
+                row = dict(zip(columns, row_values)) # <--- FIX: Create dict from list
+                sockets_data.append({ 'protocol': row.get("Protocol", "N/A"), 'address': row.get("Address", "N/A"), 'port': row.get("Port", "N/A"), 'pid': row.get("PID", "N/A"), 'process_name': get_process_name(row.get("PID")), 'is_hidden': True })
+    
+    for pid, pdata in raw_data.items():
+        process_details = {
+            'pid': pid,
+            'process_name': pdata.get('process_name', 'Unknown'),
+            'score': 0,
+            'vt_score': 'N/A',
+            'reasons': [],
+            'is_hidden': 'hidden_process' in pdata.get('reasons', {})
+        }
+
+        total_score = 0
+        vt_score = None
+
+        for reason_key, reason_list in pdata.get('reasons', {}).items():
+            for reason in reason_list:
+                if not isinstance(reason, dict):
+                    continue
+
+                category = reason.get('category')
+                reason_text = reason.get('reason', '')
+                formatted_reason = reason_text
+                if reason_key == 'vtscanx_reasons':
+                    try:
+                        vt_score = int(category)
+                        total_score += vt_score
+                    except (ValueError, TypeError):
+                        pass
+                else:
+                    cat_score = get_priority(category)
+                    total_score += cat_score
+                    if cat_score > 0 and category:
+                        category_scores[category] = category_scores.get(category, 0) + cat_score
+                
+                if category == 'DLLInjected' and '\n' in reason_text:
+                    lines = reason_text.splitlines()
+                    header = lines[0]
+                    dll_paths = [line.strip() for line in reason_text.splitlines()[1:] if line.strip()]
+                    html_list = u'<ol class="injected-dll-list">'
+                    for path in dll_paths:
+                        suspicious_dlls.append({
+                            # --- FIX APPLIED HERE ---
+                            'name': ntpath.basename(path) if path else 'Unknown DLL',
+                            'path': path,
+                            'reason': 'Injected DLL',
+                            'process_name': process_details['process_name'],
+                            'pid': pid,
+                            'vt_score': 'N/A'
+                        })
+                        html_list += u'<li>{}</li>'.format(path)
+                    html_list += u'</ol>'
+                    formatted_reason = header + html_list
+                
+                elif category == 'DLLIllegitimatePath':
+                    path = reason_text.split('illegitimate path:')[-1].strip()
+                    suspicious_dlls.append({
+                        # --- FIX APPLIED HERE ---
+                        'name': ntpath.basename(path) if path else 'Unknown DLL',
+                        'path': path,
+                        'reason': 'Loaded from suspicious path',
+                        'process_name': process_details['process_name'],
+                        'pid': pid,
+                        'vt_score': 'N/A'
+                    })
+
+                elif category == 'DLLMissingFromList':
+                    path = reason_text.split('Path:')[-1].strip()
+                    missing_from_match = re.search(r'\[(.*?)\]', reason_text)
+                    custom_reason = "Missing from [{}]".format(missing_from_match.group(1)) if missing_from_match else "Missing from PEB order"
+                    
+                    suspicious_dlls.append({
+                        # --- FIX APPLIED HERE ---
+                        'name': ntpath.basename(path) if path else 'Unknown DLL',
+                        'path': path,
+                        'reason': custom_reason,
+                        'process_name': process_details['process_name'],
+                        'pid': pid,
+                        'vt_score': 'N/A'
+                    })
+
+                elif category == 'SuspiciousFile':
+                    path = reason_text.split('Accessed suspicious file:')[-1].strip()
+                    suspicious_files.append({
+                        'name': ntpath.basename(path) if path else 'Unknown File',
+                        'path': path,
+                        'pid': pid,
+                        'process_name': process_details['process_name'],
+                        'offset': reason.get('offset')
+                    })
+    
+
+                elif reason_key == 'vtscanx_reasons':
+                    score_match = re.search(r'score: (\d+)', reason_text)
+                    if score_match:
+                        score_num = int(score_match.group(1))
+                        score_text = score_match.group(0) # e.g., "score: 67"
+                        
+                        # Determine risk level for coloring
+                        risk_class = 'low'
+                        if score_num >= 60: risk_class = 'high'
+                        elif score_num >= 30: risk_class = 'medium'
+                        
+                        # Create the colored span for just the number
+                        colored_score = u'score: <span class="score-{}">{}</span>'.format(risk_class, score_num)
+                        
+                        # Replace the original "score: XX" text with the new HTML version
+                        formatted_reason = reason_text.replace(score_text, colored_score, 1)
+
+                process_details['reasons'].append(formatted_reason)
+
+        process_details['score'] = total_score
+        if vt_score is not None:
+            process_details['vt_score'] = vt_score
         
+        formatted_processes.append(process_details)
+
+    network_data = {
+        'connections': connections_data,
+        'sockets': sockets_data,
+        'networks': netscan_data
+    }
+
+    return formatted_processes, suspicious_dlls, suspicious_files, network_data, category_scores
+
+def get_risk_level(vt_score, score):
+    # Normalize: handle Nones or 'N/A'
+    vt = vt_score if isinstance(vt_score, int) else 0
+    sc = (score if isinstance(score, int) else 0) - vt
+
+    # Classify each independently
+    def classify(val):
+        if val >= 60:
+            return 'high'
+        elif val >= 30:
+            return 'medium'
+        else:
+            return 'low'
+
+    vt_risk = classify(vt)
+    score_risk = classify(sc)
+
+    # Combine smartly:
+    if vt_risk == 'high' or score_risk == 'high':
+        return 'high'
+    elif vt_risk == 'medium' or score_risk == 'medium':
+        return 'medium'
+    else:
+        return 'low'
+
+def generate_html_report(report_name, report_dir, include_plugins=None, include_all=None):
+    file_hash = calculate_sha256(memory_file)
+    included_plugins =[]
+    if include_all:
+        included_plugins = list(plugins)
+    if include_plugins:
+        for p in include_plugins:
+            if p not in plugins:
+                run_plugin(memory_file, profile, p, results)
+            if p not in included_plugins:
+                included_plugins.append(p)
+    suspicious_list, suspicious_dlls_list, suspicious_files_list, network_data, category_scores = format_suspicious_data(suspicious_processes)
+
+    high_risk = len([p for p in suspicious_list if get_risk_level(p.get('vt_score'), p.get('score')) == 'high'])
+    medium_risk = len([p for p in suspicious_list if get_risk_level(p.get('vt_score'), p.get('score')) == 'medium'])
+    low_risk = len([p for p in suspicious_list if get_risk_level(p.get('vt_score'), p.get('score')) == 'low'])
+
+    
+    data = {
+        'title': memory_file + ' report',
+        'profile': profile,
+        'memory_file': memory_file,
+        'file_hash': file_hash,
+        'generation_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'suspicious_processes': suspicious_list,
+        'suspicious_dlls': suspicious_dlls_list,
+        'suspicious_files': suspicious_files_list,
+        'network_data': network_data,
+        'high_risk_count': high_risk,
+        'medium_risk_count': medium_risk,
+        'category_scores': category_scores,
+        'low_risk_count': low_risk,
+        'other_plugins': included_plugins,
+        'ssdt_hooks': analyze_ssdt_hooks(),
+        'suspicious_modules': analyze_suspicious_modules(),
+        'results': results
+    }
+    output = template.render(data)
+    report_path = os.path.join(report_dir, report_name + '.html')
+    with open(report_path, 'w') as f:
+        f.write(output.encode('utf-8'))
+    print(report_path)
 
 def get_profile(memory_file):
     """Run imageinfo to get suggested profiles."""
@@ -1550,26 +1569,22 @@ def get_profile(memory_file):
     global suggested_profiles
     suggested_profiles = []
 
-    try:
-        process = subprocess.Popen("python2 vol.py -f '{}' imageinfo".format(memory_file), shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+    process = subprocess.Popen("python2.7 vol.py -f '{}' imageinfo".format(memory_file), shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
 
-        for line in iter(process.stdout.readline, ''):
-            print line,
-            if "Suggested Profile(s)" in line:
-                profile_line = line.split(":", 1)[-1].strip()
-                
-                # Clean profiles: remove anything in parentheses and strip whitespace
-                raw_profiles = profile_line.split(',')
-                for p in raw_profiles:
-                    clean_profile = re.sub(r"\s*\(.*?\)", "", p).strip()
-                    if clean_profile:
-                        suggested_profiles.append(clean_profile)
+    for line in iter(process.stdout.readline, ''):
+        print line,
+        if "Suggested Profile(s)" in line:
+            profile_line = line.split(":", 1)[-1].strip()
+            
+            # Clean profiles: remove anything in parentheses and strip whitespace
+            raw_profiles = profile_line.split(',')
+            for profile in raw_profiles:
+                clean_profile = re.sub(r"\s*\(.*?\)", "", profile).strip()
+                if clean_profile:
+                    suggested_profiles.append(clean_profile)
 
-        process.stdout.close()
-        process.wait()
-    except Exception as e:
-        print("[-] Error running imageinfo: {}".format(e))
-
+    process.stdout.close()
+    process.wait()
 
     return suggested_profiles if suggested_profiles else None
 
@@ -1599,42 +1614,35 @@ def main():
 
     args = parse_arguments()
 
-    if not args.file:
-        print("Usage: python2 {} -f <memory_dump_file> [options]".format(sys.argv[0]))
+    if len(sys.argv) < 3 or sys.argv[1] != '-f':
+        print("Usage: python2 update.py -f <memory_dump_file>")
         sys.exit(1)
 
     memory_file = args.file
 
     if not os.path.exists(memory_file):
-        print("[-] Error: Memory file not found at '{}'".format(memory_file))
-        sys.exit(1)
+        print("Error: Memory file does not exist:", memory_file)
+        return
 
     if args.profile:
         profile = args.profile.strip()
     else:
-        # This is the restored interactive block
-        s_profiles = get_profile(memory_file)
-        if s_profiles:
-            use_suggested = raw_input("\nUse suggested profile '{}'? [Enter=yes, type 'no' for manual]: ".format(s_profiles[0])).strip().lower()
-            if use_suggested in ['', 'yes', 'y']:
-                profile = s_profiles[0]
-            else:
-                profile = raw_input("Enter the profile to use: ").strip()
+        suggested_profiles = get_profile(memory_file)
+        if suggested_profiles:
+            use_suggested = raw_input("\nUse suggested profile '{}'? [Enter=yes, type 'no' for manual]: ".format(suggested_profiles[0])).strip().lower()
+            profile = suggested_profiles[0] if use_suggested in ['', 'yes', 'y'] else raw_input("Enter the profile to use: ").strip()
+            # profile = suggested_profiles[0]
         else:
             print("No suggested profiles found.")
             profile = raw_input("Enter the profile to use: ").strip()
 
-    if not profile:
-        print("[-] No profile selected. Exiting.")
-        sys.exit(1)
-
     if profile not in profiles:
-        print("\n[!] Warning: The profile '{}' is not in this script's known list.".format(profile))
-        print("[*] The script will attempt to use it, but it may not be compatible with all analyses.")
-        print("[*] Known profiles are:")
+        print("\n[!] Error: The profile '{}' is not valid.".format(profile))
+        print("[*] Available profiles are:")
         for p in profiles:
             print("  -", p)
-    
+        sys.exit(1)
+
     scan_procdump = args.scan_procdump
     scan_dlldump = args.scan_dlldump
     scan_suspicious_only = args.scan_suspicious_proc
@@ -1642,37 +1650,24 @@ def main():
 
     print("\nUsing profile: {}\n".format(profile))
 
-    # Determine which dump plugins to run
-    if scan_procdump or scan_suspicious_only:
-        if "procdump" not in plugins:
-            plugins.append("procdump")
+    if args.scan_procdump or args.scan_suspicious_proc:
+        plugins.append("procdump")
     
-    if scan_dlldump or scan_suspicious_dll_only:
-        if "dlldump" not in plugins:
-            plugins.append("dlldump")
+    if args.scan_dlldump or args.scan_suspicious_dll:
+        plugins.append("dlldump")
 
     threads = []
-    # Determine if we should run netscan or the older network plugins
-    is_win7_or_later = False
-    try:
-        # This check is fragile if `profiles` list is incomplete, but it's a good heuristic
-        if profile in profiles and profiles.index(profile) >= profiles.index("Win7SP0x64"):
-             is_win7_or_later = True
-    except (ValueError, AttributeError):
-        # Fallback for profiles not in the list, like Win10x64_15063
-        if any(p in profile.lower() for p in ['win7', 'win8', 'win10', '2008', '2012', '2016', '2019']):
-            is_win7_or_later = True
-
-    current_plugins = list(plugins)
-    if "networkscan" in current_plugins:
-        if not is_win7_or_later:
-            # It's older (like XP), replace networkscan with older plugins
-            print("[*] Profile appears to be pre-Win7. Using connections, connscan, etc. instead of netscan.")
-            current_plugins.remove("networkscan")
-            current_plugins.extend(["connections", "connscan", "sockets", "sockscan"])
-
-    for plugin in set(current_plugins): # Use set to avoid duplicates
-        thread = threading.Thread(target=run_plugin, args=(memory_file, profile, plugin, results))
+    for plugin in plugins:
+        if plugin == "networkscan" and profiles.index(profile) >= 9:
+            thread = threading.Thread(target=run_plugin, args=(memory_file, profile, "netscan", results))
+        elif plugin == "networkscan":
+            for net_plugin in ["connections", "connscan", "sockets", "sockscan"]:
+                thread = threading.Thread(target=run_plugin, args=(memory_file, profile, net_plugin, results))
+                thread.start()
+                threads.append(thread)
+            continue
+        else:
+            thread = threading.Thread(target=run_plugin, args=(memory_file, profile, plugin, results))
         thread.start()
         threads.append(thread)
 
@@ -1681,18 +1676,16 @@ def main():
 
     NPIP_check()
     analyze_hidden_network_artifacts()
-    if VTSCANX_API_KEY and (scan_procdump or scan_dlldump or scan_suspicious_only or scan_suspicious_dll_only):
+    if VTSCANX_API_KEY:
         vtscanx_scan()
     analyse_ldrmodules_malfind()
-
     include_plugins = args.include_plugins if args.include_plugins else []
     include_all = args.all_include_plugins
     report_name = args.report_name
     report_dir = args.report_dir
-    
-    print("\n[+] Checking for hidden processes...")
-    print_hidden_processes(results.get("pslist", {}).get("rows"), results.get("psscan", {}).get("rows"))
-    
+    if not os.path.exists(report_dir):
+        os.makedirs(report_dir)
+    print_hidden_processes(results["pslist"]["rows"], results["psscan"]["rows"])
     if args.generate_txt:
         # Decide which plugins to include in report
         generate_txt_report(report_name, report_dir, include_plugins, include_all)
@@ -1701,10 +1694,22 @@ def main():
     elif args.generate_pdf:
         generate_pdf_report(report_name, report_dir, include_plugins, include_all)
     else:
-        # Default console output if no report format is specified
+        for plugin in plugins[:4]:
+            print("\n==============================")
+            print("Running {}...".format(plugin))
+            print("==============================\n")
+            data = results.get(plugin, None)
+            if data and plugin not in ['pstree', 'hollowfind']:
+                print(tabulate(data["rows"], headers=data["columns"], tablefmt="rst"))
+            elif plugin in ['pstree', 'hollowfind']:
+                print(data)
+            else:
+                print("No output received for {}".format(plugin))
+
+        print("\n[+] Checking for hidden processes...")
+        # print_hidden_processes(results["pslist"]["rows"], results["psscan"]["rows"])
         print_suspicious_process()
         ssdt_hooks()
         suspicious_modules()
-        
 if __name__ == "__main__":
     main()
